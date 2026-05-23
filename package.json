@@ -6,10 +6,15 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
+    "postinstall": "npm run build",
     "start": "node dist/index.js",
     "lint": "tsc --noEmit"
   },
-  "keywords": ["interview", "ai", "copilot"],
+  "keywords": [
+    "interview",
+    "ai",
+    "copilot"
+  ],
   "license": "MIT",
   "type": "module",
   "dependencies": {
