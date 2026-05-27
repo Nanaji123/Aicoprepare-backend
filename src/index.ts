@@ -26,6 +26,10 @@ app.use(
       if (env.CORS_ORIGINS.includes(origin)) {
         return callback(null, true);
       }
+      // Explicitly allow production frontend
+      if (origin === "https://aicoprepare.vercel.app") {
+        return callback(null, true);
+      }
       // In development, be more permissive
       if (env.NODE_ENV === "development") {
         return callback(null, true);
