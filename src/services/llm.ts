@@ -29,11 +29,13 @@ function buildSystemPrompt(config?: InterviewConfig): string {
 Context: ${ctx}
 
 Rules:
+- Format: Always start with a single introductory sentence, then use bullet points below it.
+- Bold key terms: Highlight key concepts/terms in **bold** within the bullet points.
 - Coding → working code + 1-line explanation per key step
 - Behavioral → STAR in ≤4 bullet points  
 - System design → components → trade-offs → scale, each as a short bullet
 - Ambiguous question → pick most likely intent, answer it
-- No preamble. No "here's how to answer". Start with the answer.
+- No preamble like "Here is how I would answer". Start directly with the answer's introductory sentence.
 - Markdown: use bullets and code blocks only. No prose paragraphs.`;
 }
 
@@ -99,6 +101,7 @@ export async function streamAnswer(
       }
     }
 
+    console.log("\n[LLM] AI Response (streamAnswer):\n", fullAnswer, "\n");
     callbacks.onComplete(fullAnswer);
   } catch (err) {
     const message = err instanceof Error ? err.message : "LLM streaming failed";
@@ -151,6 +154,7 @@ export async function streamManualAnswer(
       }
     }
 
+    console.log("\n[LLM] AI Response (streamManualAnswer):\n", fullAnswer, "\n");
     callbacks.onComplete(fullAnswer);
   } catch (err) {
     const message = err instanceof Error ? err.message : "LLM streaming failed";
@@ -215,6 +219,7 @@ export async function streamScreenAnalysis(
       }
     }
 
+    console.log("\n[LLM] AI Response (streamScreenAnalysis):\n", fullAnswer, "\n");
     callbacks.onComplete(fullAnswer);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Vision analysis failed";
