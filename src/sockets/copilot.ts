@@ -3,6 +3,7 @@ import {
   streamAnswer,
   streamManualAnswer,
   streamScreenAnalysis,
+  conversationMemory,
 } from "../services/llm.js";
 import { getSession, saveAIAnswer } from "../services/interview.js";
 import type {
@@ -87,7 +88,7 @@ export function registerCopilotHandlers(namespace: Namespace): void {
 
       const config = sessionConfigs.get(sessionId);
 
-      // Stream AI answer back to the client
+      // Stream AI answer back to the client (with conversation memory)
       await streamAnswer(text, config, {
         onStart: () => {
           socket.emit("ai_answer_start", {
@@ -122,7 +123,7 @@ export function registerCopilotHandlers(namespace: Namespace): void {
             timestamp: new Date().toISOString(),
           });
         },
-      }, language);
+      }, language, sessionId);
     });
 
     // ─── Manual Question ───────────────────────────────────────────
@@ -170,7 +171,7 @@ export function registerCopilotHandlers(namespace: Namespace): void {
             timestamp: new Date().toISOString(),
           });
         },
-      }, language);
+      }, language, sessionId);
     });
 
     // ─── Screen Capture ────────────────────────────────────────────
@@ -233,6 +234,7 @@ export function registerCopilotHandlers(namespace: Namespace): void {
 
       socket.leave(sessionId);
       sessionConfigs.delete(sessionId);
+      conversationMemory.clear(sessionId);
 
       console.log(
         `[Copilot] User ${userId} left session ${sessionId}`
@@ -248,6 +250,7 @@ export function registerCopilotHandlers(namespace: Namespace): void {
       // Clean up session config if this was the last connection
       if (currentSessionId) {
         sessionConfigs.delete(currentSessionId);
+        conversationMemory.clear(currentSessionId);
       }
     });
   });
