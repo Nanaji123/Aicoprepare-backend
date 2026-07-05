@@ -4,6 +4,7 @@ import {
   streamManualAnswer,
   streamScreenAnalysis,
   conversationMemory,
+  needsResponse,
 } from "../services/llm.js";
 import { getSession, saveAIAnswer } from "../services/interview.js";
 import type {
@@ -11,6 +12,8 @@ import type {
   TranscriptFinalPayload,
   ManualQuestionPayload,
   ScreenCapturePayload,
+  SetAnswerModePayload,
+  RequestAnswerPayload,
   InterviewConfig,
 } from "../types/index.js";
 
@@ -22,12 +25,15 @@ import type {
  * - Receiving finalized transcripts and generating AI answers
  * - Receiving manual questions and generating AI answers
  * - Receiving screenshots and generating visual analysis
+ * - Answer mode switching (auto vs normal with intent classification)
  *
  * All AI answers are streamed chunk-by-chunk to the client.
  */
 
 // In-memory session config cache (sessionId → config)
 const sessionConfigs = new Map<string, InterviewConfig>();
+// Answer mode per session: "auto" = always answer, "normal" = use intent classifier
+const answerModes = new Map<string, "auto" | "normal">();
 
 export function registerCopilotHandlers(namespace: Namespace): void {
   namespace.on("connection", (socket: Socket) => {
@@ -74,6 +80,14 @@ export function registerCopilotHandlers(namespace: Namespace): void {
       });
     });
 
+    // ─── Set Answer Mode ────────────────────────────────────────────
+    // Fired when the user toggles between "auto" and "normal" mode.
+    socket.on("set_answer_mode", (payload: SetAnswerModePayload) => {
+      const { sessionId, mode } = payload;
+      answerModes.set(sessionId, mode);
+      console.log(`[Copilot] Answer mode set to "${mode}" for session ${sessionId}`);
+    });
+
     // ─── Transcript Final ──────────────────────────────────────────
     // Fired when Deepgram detects an utterance end from the interviewer.
     // The desktop client buffers the transcript and sends it here.
@@ -87,6 +101,21 @@ export function registerCopilotHandlers(namespace: Namespace): void {
       );
 
       const config = sessionConfigs.get(sessionId);
+      const mode = answerModes.get(sessionId) || "normal";
+
+      // In normal mode, check if the utterance actually needs a response
+      if (mode === "normal") {
+        const shouldRespond = await needsResponse(text);
+        if (!shouldRespond) {
+          console.log(`[Copilot] Skipped (no response needed): "${text.substring(0, 60)}..."`);
+          socket.emit("transcript_skipped", {
+            sessionId,
+            text,
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+      }
 
       // Stream AI answer back to the client (with conversation memory)
       await streamAnswer(text, config, {
@@ -117,6 +146,54 @@ export function registerCopilotHandlers(namespace: Namespace): void {
         },
         onError: (error: string) => {
           console.error("[Copilot] AI answer error:", error);
+          socket.emit("ai_answer", {
+            sessionId,
+            answer: `⚠️ Sorry, I couldn't generate an answer. Error: ${error}`,
+            timestamp: new Date().toISOString(),
+          });
+        },
+      }, language, sessionId);
+    });
+
+    // ─── Request Answer (Manual override for skipped transcripts) ──
+    // Fired when the user clicks "Answer" on a skipped transcript.
+    socket.on("request_answer", async (payload: RequestAnswerPayload) => {
+      const { sessionId, text, language } = payload;
+
+      if (!text || !text.trim()) return;
+
+      console.log(
+        `[Copilot] Manual answer requested for session ${sessionId}: "${text.substring(0, 80)}..."`
+      );
+
+      const config = sessionConfigs.get(sessionId);
+
+      await streamAnswer(text, config, {
+        onStart: () => {
+          socket.emit("ai_answer_start", {
+            sessionId,
+            timestamp: new Date().toISOString(),
+          });
+        },
+        onChunk: (chunk: string) => {
+          socket.emit("ai_answer_chunk", {
+            sessionId,
+            chunk,
+            timestamp: new Date().toISOString(),
+          });
+        },
+        onComplete: async (fullAnswer: string) => {
+          socket.emit("ai_answer", {
+            sessionId,
+            answer: fullAnswer,
+            timestamp: new Date().toISOString(),
+          });
+
+          saveAIAnswer(sessionId, text, fullAnswer, "manual").catch(
+            (err) => console.error("[Copilot] Failed to save answer:", err)
+          );
+        },
+        onError: (error: string) => {
           socket.emit("ai_answer", {
             sessionId,
             answer: `⚠️ Sorry, I couldn't generate an answer. Error: ${error}`,
@@ -234,6 +311,7 @@ export function registerCopilotHandlers(namespace: Namespace): void {
 
       socket.leave(sessionId);
       sessionConfigs.delete(sessionId);
+      answerModes.delete(sessionId);
       conversationMemory.clear(sessionId);
 
       console.log(
@@ -250,6 +328,7 @@ export function registerCopilotHandlers(namespace: Namespace): void {
       // Clean up session config if this was the last connection
       if (currentSessionId) {
         sessionConfigs.delete(currentSessionId);
+        answerModes.delete(currentSessionId);
         conversationMemory.clear(currentSessionId);
       }
     });

@@ -65,6 +65,17 @@ export interface ScreenCapturePayload {
   uint8Array: Uint8Array;
 }
 
+export interface SetAnswerModePayload {
+  sessionId: string;
+  mode: "auto" | "normal";
+}
+
+export interface RequestAnswerPayload {
+  sessionId: string;
+  text: string;
+  language?: string;
+}
+
 // ─── Socket Events (Server → Client) ─────────────────────────────
 
 export interface AIAnswerStartEvent {

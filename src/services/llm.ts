@@ -1,40 +1,34 @@
 import OpenAI from "openai";
+import sharp from "sharp";
 import { env } from "../config/env.js";
 import type { InterviewConfig } from "../types/index.js";
 
-/**
- * LLM Service — handles AI answer generation via Groq (OpenAI-compatible).
- *
- * Features:
- * - Per-session conversation memory (sliding window)
- * - Smart question classification (coding/behavioral/system-design/situational/general)
- * - Question-type-specific prompt routing
- * - Tuned parameters for interview-quality answers
- * - Streaming via callbacks for real-time Socket.IO delivery
- */
-
 const openai = new OpenAI({
   apiKey: env.OPENAI_API_KEY,
-  baseURL: "https://api.groq.com/openai/v1"
 });
 
-// ─── Conversation Memory ───────────────────────────────────────────
+// ─── Extended Types ────────────────────────────────────────────────
+
+export interface ExtendedInterviewConfig extends InterviewConfig {
+  interviewRound?: string;
+  userCvText?: string;
+}
 
 interface MemoryEntry {
   role: "user" | "assistant";
   content: string;
 }
 
-/** Per-session sliding-window conversation memory. */
+// ─── Conversation Memory ───────────────────────────────────────────
+
 class ConversationMemory {
   private sessions = new Map<string, MemoryEntry[]>();
   private readonly maxPairs: number;
 
   constructor(maxPairs = 6) {
-    this.maxPairs = maxPairs; // Keep last N Q&A pairs (2 entries each)
+    this.maxPairs = maxPairs;
   }
 
-  /** Add a question + answer pair to the session history. */
   addExchange(sessionId: string, question: string, answer: string): void {
     if (!this.sessions.has(sessionId)) {
       this.sessions.set(sessionId, []);
@@ -43,19 +37,16 @@ class ConversationMemory {
     history.push({ role: "user", content: question });
     history.push({ role: "assistant", content: answer });
 
-    // Trim to sliding window (maxPairs * 2 entries)
     const maxEntries = this.maxPairs * 2;
     if (history.length > maxEntries) {
       this.sessions.set(sessionId, history.slice(-maxEntries));
     }
   }
 
-  /** Get conversation history as OpenAI-compatible messages. */
   getHistory(sessionId: string): MemoryEntry[] {
     return this.sessions.get(sessionId) || [];
   }
 
-  /** Clear session memory (on leave/disconnect). */
   clear(sessionId: string): void {
     this.sessions.delete(sessionId);
   }
@@ -63,158 +54,130 @@ class ConversationMemory {
 
 export const conversationMemory = new ConversationMemory(6);
 
+// ─── Intent Classifier (needs response?) ───────────────────────────
+
+/**
+ * Lightweight intent classifier that determines whether an interviewer's
+ * utterance requires the candidate to give a substantive answer.
+ *
+ * Returns `true` for real questions/prompts, `false` for casual chat,
+ * filler, acknowledgments, or context-setting monologues.
+ */
+export async function needsResponse(text: string): Promise<boolean> {
+  // Very short utterances are almost never real questions
+  const trimmed = text.trim();
+  if (trimmed.split(/\s+/).length < 3) return false;
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content: `You are an intent classifier for an interview copilot. Determine if the interviewer's speech requires the candidate to give a substantive answer.
+
+Return "YES" if:
+- It's a direct question (technical, behavioral, situational)
+- It asks the candidate to explain, describe, or elaborate something
+- It requests the candidate to introduce themselves or share experience
+- It asks the candidate to solve a problem or write code
+
+Return "NO" if:
+- It's casual small talk or pleasantries ("Hi, how are you?", "Nice to meet you")
+- It's the interviewer giving context or explaining something without asking
+- It's filler speech ("Let me share my screen", "One moment", "Hold on")
+- It's acknowledgment ("Sounds good", "Okay", "Got it", "That makes sense")
+- It's too short or unclear to be a real question
+
+Respond with ONLY "YES" or "NO".`,
+        },
+        { role: "user", content: trimmed },
+      ],
+      max_tokens: 3,
+      temperature: 0,
+    });
+
+    const answer = response.choices[0]?.message?.content?.trim().toUpperCase();
+    console.log(`[Intent Classifier] "${trimmed.substring(0, 60)}..." → ${answer}`);
+    return answer === "YES";
+  } catch (err) {
+    // On error, default to generating a response (safe fallback)
+    console.error("[Intent Classifier] Error, defaulting to YES:", err);
+    return true;
+  }
+}
+
 // ─── Question Classification ───────────────────────────────────────
 
 type QuestionType = "coding" | "behavioral" | "system_design" | "situational" | "general";
 
-const CODING_KEYWORDS = [
-  "code", "function", "algorithm", "implement", "write a", "program",
-  "data structure", "array", "linked list", "tree", "graph", "hash",
-  "sort", "search", "binary", "dynamic programming", "recursion",
-  "time complexity", "space complexity", "big o", "leetcode",
-  "reverse", "palindrome", "fibonacci", "two sum", "matrix",
-  "stack", "queue", "heap", "trie", "dfs", "bfs",
-  "api", "endpoint", "database query", "sql", "regex",
-  "debug", "bug", "error", "fix this", "what's wrong",
-];
-
-const BEHAVIORAL_KEYWORDS = [
-  "tell me about a time", "describe a situation", "give me an example",
-  "how did you handle", "what would you do if", "challenge",
-  "conflict", "failure", "mistake", "difficult", "teamwork",
-  "leadership", "mentor", "feedback", "disagreement",
-  "proud of", "achievement", "accomplishment", "overcame",
-  "tell me about yourself", "why should we hire", "strengths",
-  "weaknesses", "where do you see yourself",
-];
-
-const SYSTEM_DESIGN_KEYWORDS = [
-  "design", "architect", "system", "scalab", "microservice",
-  "load balancer", "cache", "database design", "distributed",
-  "high availability", "throughput", "latency", "cdn",
-  "message queue", "kafka", "redis", "sharding", "replication",
-  "api gateway", "rate limit", "url shortener", "chat system",
-  "notification", "newsfeed", "payment", "search engine",
-];
-
-const SITUATIONAL_KEYWORDS = [
-  "what would you do", "how would you approach", "imagine",
-  "scenario", "if you were", "hypothetical", "suppose",
-  "how would you handle", "prioritize", "deadline",
-  "stakeholder", "trade-off", "decision",
-];
+const CODING_KEYWORDS = ["code", "function", "algorithm", "implement", "write a", "program", "data structure", "array", "fix this", "bug", "error", "wrong in"];
+const BEHAVIORAL_KEYWORDS = ["tell me about a time", "describe a situation", "challenge", "conflict", "teamwork", "leadership"];
+const SYSTEM_DESIGN_KEYWORDS = ["design", "architect", "system", "scalable", "microservice", "load balancer", "cache", "database design"];
+const SITUATIONAL_KEYWORDS = ["what would you do", "how would you approach", "scenario", "deadline", "trade-off"];
 
 function classifyQuestion(question: string): QuestionType {
   const lower = question.toLowerCase();
+  const scores: Record<QuestionType, number> = { coding: 0, behavioral: 0, system_design: 0, situational: 0, general: 1 };
 
-  // Score each category
-  const scores: Record<QuestionType, number> = {
-    coding: 0,
-    behavioral: 0,
-    system_design: 0,
-    situational: 0,
-    general: 1, // Default bias
-  };
+  for (const kw of CODING_KEYWORDS) if (lower.includes(kw)) scores.coding += 2;
+  for (const kw of BEHAVIORAL_KEYWORDS) if (lower.includes(kw)) scores.behavioral += 2;
+  for (const kw of SYSTEM_DESIGN_KEYWORDS) if (lower.includes(kw)) scores.system_design += 2;
+  for (const kw of SITUATIONAL_KEYWORDS) if (lower.includes(kw)) scores.situational += 2;
 
-  for (const kw of CODING_KEYWORDS) {
-    if (lower.includes(kw)) scores.coding += 2;
-  }
-  for (const kw of BEHAVIORAL_KEYWORDS) {
-    if (lower.includes(kw)) scores.behavioral += 2;
-  }
-  for (const kw of SYSTEM_DESIGN_KEYWORDS) {
-    if (lower.includes(kw)) scores.system_design += 2;
-  }
-  for (const kw of SITUATIONAL_KEYWORDS) {
-    if (lower.includes(kw)) scores.situational += 2;
-  }
-
-  // Return highest-scoring type
   const sorted = Object.entries(scores).sort((a, b) => b[1] - a[1]);
-  const result = sorted[0][0] as QuestionType;
-
-  console.log(`[LLM] Question classified as: ${result} (scores: ${JSON.stringify(scores)})`);
-  return result;
+  return sorted[0][0] as QuestionType;
 }
 
 // ─── System Prompts ────────────────────────────────────────────────
 
-function buildSystemPrompt(config?: InterviewConfig, questionType?: QuestionType): string {
+function buildSystemPrompt(config?: ExtendedInterviewConfig, questionType?: QuestionType): string {
   const ctx = config ? [
-    config.role && `Role: ${config.role}`,
-    config.company && `Company: ${config.company}`,
-    config.experienceLevel && `Level: ${config.experienceLevel}`,
-    config.jobDescription && `JD: ${config.jobDescription}`,
-  ].filter(Boolean).join(" | ") : "General";
+    config.role && `Target Role: ${config.role}`,
+    config.company && `Target Company: ${config.company}`,
+    config.experienceLevel && `Target Seniority Level: ${config.experienceLevel}`,
+    config.interviewRound && `Target Round: ${config.interviewRound}`,
+  ].filter(Boolean).join(" | ") : "General Technical Interview";
 
-  // Base persona
-  let prompt = `You are an elite interview copilot. You ARE the candidate — confident, articulate, and technically sharp. You speak from first-person experience with real depth.
+  const cvContext = config?.userCvText
+    ? `\nCandidate's CV Summary:\n${config.userCvText}\n`
+    : "";
 
-Context: ${ctx}
+  let prompt = `You are an elite interview copilot. You ARE the candidate. Your goal is to provide an immediate, highly scannable spoken script for the user to say out loud to the interviewer. Speak exclusively in the first person ("I", "my projects"). Blend the requirements of the target role perfectly with the candidate's actual CV details provided below.
 
-Core Rules:
-- Start with a strong opening sentence that directly answers the question.
-- Then use **bullet points** with **bold key terms** for the details.
-- Sound natural, confident, and human — not robotic or generic.
-- Reference specific technologies, metrics, and real-world examples.
-- Never say "Here is how I would answer" or similar meta-commentary. Just answer.
-- If prior conversation context is provided, reference it naturally ("As I mentioned earlier...", "Building on my previous point...").
-- Use Markdown formatting: bold, bullets, code blocks where appropriate.`;
+Context Metrics: ${ctx}
+${cvContext}
 
-  // Question-type-specific instructions
+🛑 STRICT NO-PREAMBLE & ANTI-AI FILLER RULES:
+- NEVER include introductory pleasantries, meta-commentary, or setup sentences (e.g., Do NOT say "Absolutely, I can address that!", "Great question", "Here is how I would respond:"). 
+- Begin your response IMMEDIATELY with the actual structural answer text.
+
+🏢 MANDATORY SCRIPT FLOW & LAYOUT STRUCTURE:
+1. **Opening Statement:** Start with 1 clear, direct introductory sentence overview answering the question.
+2. **Summary Paragraph:** Follow up with a short transition sentence or brief paragraph summarizing the main architectural attributes/features you are highlighting.
+3. **Structured Bullet Points:** You MUST break down listed items using individual bullet lines starting with a dash marker ("-"). 
+   - **CRITICAL:** You must place a clear DOUBLE LINE BREAK (\\n\\n) directly before and after EVERY single bullet item so they are isolated blocks in the UI layout. 
+   - Start each bullet item with **bolded key terms** (e.g., "- **Null Safety:** Explanation text.").
+4. **Wrap-up Conclusion:** Conclude with a clear, single-sentence wrap-up statement linking the skill back to your development workflow.
+
+🛑 CRITICAL NO-BACKTICKS RULES FOR UI SAFETY:
+- NEVER use backticks (\` \`) or markdown inline code wrappers for short code snippets, parameters, single attributes, HTML tags, or variables (e.g., do NOT write \`target="_blank"\` or \`<a>\`). Use regular quotation marks (e.g., "target="_blank"") or flat unformatted text instead.
+- isolated markdown blocks (\`\`\`javascript ... \`\`\`) with distinct line breaks are STRICTLY reserved for large, multi-line functional implementations, algorithms, or deep architectural adjustments.`;
+
   switch (questionType) {
     case "coding":
-      prompt += `
-
-Coding Question Rules:
-- Provide complete, working code with inline comments on key lines.
-- State the **time complexity** and **space complexity**.
-- Mention edge cases and how the solution handles them.
-- If multiple approaches exist, briefly mention the brute-force then present the optimal.
-- Use proper code blocks with language tags.`;
+      prompt += `\n\nCoding Rules:\n- Provide optimal implementation architectures inside multi-line code blocks ONLY if they are multi-line code structures.\n- Format follow-up talking points as clean, double-spaced bullets detailing time/space complexity and edge cases.\n- If diagnosing code, immediately declare the root cause before spitting out the clean code correction.`;
       break;
-
     case "behavioral":
-      prompt += `
-
-Behavioral Question Rules:
-- Use the **STAR method**: Situation → Task → Action → Result.
-- Keep it to 4-5 bullet points maximum.
-- Include a specific, quantifiable result when possible (e.g., "reduced latency by 40%").
-- Make the story feel real and personal — use specific team names, project names, or technologies.
-- End with a brief reflection or lesson learned.`;
+      prompt += `\n\nBehavioral Rules:\n- Strictly apply the STAR configuration mapped to the candidate's CV milestones.\n- Enforce distinct double line breaks between structural markers: **Situation**, **Task**, **Action**, and **Quantitative Results**.`;
       break;
-
     case "system_design":
-      prompt += `
-
-System Design Question Rules:
-- Start with **requirements clarification** (1-2 bullets on scope/scale).
-- Break into components: **High-Level Architecture** → **Core Components** → **Data Model** → **Scaling**.
-- Discuss **trade-offs** explicitly (SQL vs NoSQL, consistency vs availability, etc.).
-- Mention specific technologies by name (Redis, Kafka, PostgreSQL, etc.).
-- Address bottlenecks and how to mitigate them.`;
+      prompt += `\n\nSystem Design Rules:\n- Break complex architectures down using distinct, separated bullet headers: Requirements → High-Level → Components → Scaling configurations.`;
       break;
-
     case "situational":
-      prompt += `
-
-Situational Question Rules:
-- Show structured thinking: acknowledge the situation → outline your approach → explain your decision.
-- Demonstrate leadership qualities and emotional intelligence.
-- Mention how you'd communicate with stakeholders.
-- Give a concrete example if possible.`;
-      break;
-
     case "general":
     default:
-      prompt += `
-
-General Question Rules:
-- Be concise but substantial — don't give one-word answers.
-- Show enthusiasm and genuine interest in the role/company.
-- Connect your experience to the specific opportunity.
-- Keep introductions to 3-4 strong bullet points max.`;
+      prompt += `\n\nGeneral/Situational Rules:\n- Follow the mandatory script layout rigidly: Core opening statement, transition phrase paragraph summarizing points, bulleted items separated by double line breaks with bold anchors, and a 1-sentence analytical wrap-up.`;
       break;
   }
 
@@ -222,16 +185,14 @@ General Question Rules:
 }
 
 const SCREEN_ANALYSIS_PROMPT =
-  `You are an elite interview copilot analyzing a screenshot. Respond as the candidate — sharp and direct.
+  `You are an elite interview copilot analyzing a visual canvas or live window screenshot. Your job is to output a clean script showing the candidate EXACTLY what to say out loud to their interviewer to answer the question perfectly.
 
 Rules:
-- **Coding problem** → Provide complete solution code with key line comments, state time/space complexity.
-- **MCQ** → State the correct answer in **bold**, then give a clear 1-2 line justification.
-- **Bug/error** → Identify the **root cause** in bold, then provide the corrected code.
-- **Design diagram** → Identify gaps, suggest improvements as bold-labeled bullets.
-- **Text question** → Answer directly using bullet points with bold key terms.
-
-Start with a direct opening line, then use bullets. No preamble. Markdown only.`;
+- **Tone & Perspective:** Speak entirely in the first person ("Looking closely at this...", "The way I approach this optimization..."). Write a scannable vocal response script.
+- **NO PREAMBLE:** Do not include any introductory remarks, confirmations, or conversational filler. Start streaming the exact first sentence of your analytical answer immediately.
+- **Isolating New Questions:** If the user screenshot displays an active meeting chat timeline with multiple historical message bubbles, focus exclusively on the **newest, most recent active question or code snippet** posted at the bottom interface. Ignore previously solved items completely.
+- **Strict Bullet Line Separations:** Ensure every single structural list point begins with a dash ("-") and has an explicit double line break (\\n\\n) injected between it and surrounding blocks to force visual gaps.
+- **No Backticks for Small Items:** Never output short code fragments, tags, single attributes, or variables inside inline backticks (\` \`). Format short segments using standard quotation marks (" ") inside the sentences to keep the UI clean.`;
 
 // ─── Text Answer Streaming ──────────────────────────────────────────
 
@@ -242,26 +203,19 @@ export interface StreamCallbacks {
   onError: (error: string) => void;
 }
 
-/**
- * Stream an AI answer for an interview question (from transcript).
- * Includes conversation memory and smart prompt routing.
- */
-export async function streamAnswer(
+async function executeStream(
   question: string,
-  config: InterviewConfig | undefined,
+  config: ExtendedInterviewConfig | undefined,
   callbacks: StreamCallbacks,
+  userMessageContent: string,
   language?: string,
   sessionId?: string
 ): Promise<void> {
   try {
     callbacks.onStart();
-
     const questionType = classifyQuestion(question);
-    const languageInstruction = language
-      ? `\n\nIMPORTANT: Respond in ${language}.`
-      : "";
+    const languageInstruction = language ? `\n\nIMPORTANT: Respond in ${language}.` : "";
 
-    // Build messages with conversation history
     const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
       {
         role: "system",
@@ -269,36 +223,28 @@ export async function streamAnswer(
       },
     ];
 
-    // Inject conversation memory if available
     if (sessionId) {
       const history = conversationMemory.getHistory(sessionId);
-      if (history.length > 0) {
-        messages.push({
-          role: "system",
-          content: "Previous conversation context (use this to avoid repetition and build coherent answers):",
-        });
-        for (const entry of history) {
-          messages.push({ role: entry.role, content: entry.content });
-        }
+      for (const entry of history) {
+        messages.push({ role: entry.role, content: entry.content });
       }
     }
 
     messages.push({
       role: "user",
-      content: `The interviewer asked: "${question}"\n\nProvide a clear, confident, interview-ready answer.`,
+      content: userMessageContent,
     });
 
     const stream = await openai.chat.completions.create({
-      model: "llama-3.1-8b-instant",
+      model: "gpt-4o-mini",
       messages,
       stream: true,
       max_tokens: 2000,
-      temperature: 0.4,
+      temperature: 0.3,
       top_p: 0.9,
     });
 
     let fullAnswer = "";
-
     for await (const chunk of stream) {
       const content = chunk.choices[0]?.delta?.content;
       if (content) {
@@ -307,148 +253,91 @@ export async function streamAnswer(
       }
     }
 
-    // Save to conversation memory
-    if (sessionId) {
-      conversationMemory.addExchange(sessionId, question, fullAnswer);
-    }
-
-    console.log(`\n[LLM] AI Response (streamAnswer | type=${questionType}):\n`, fullAnswer, "\n");
+    if (sessionId) conversationMemory.addExchange(sessionId, question, fullAnswer);
     callbacks.onComplete(fullAnswer);
   } catch (err) {
     const message = err instanceof Error ? err.message : "LLM streaming failed";
-    console.error("[LLM] Stream error:", message);
     callbacks.onError(message);
   }
 }
 
-/**
- * Stream an AI answer for a manually typed question.
- * Includes conversation memory and smart prompt routing.
- */
-export async function streamManualAnswer(
+export function streamAnswer(
   question: string,
-  config: InterviewConfig | undefined,
+  config: ExtendedInterviewConfig | undefined,
   callbacks: StreamCallbacks,
   language?: string,
   sessionId?: string
 ): Promise<void> {
-  try {
-    callbacks.onStart();
-
-    const questionType = classifyQuestion(question);
-    const languageInstruction = language
-      ? `\n\nIMPORTANT: Respond in ${language}.`
-      : "";
-
-    // Build messages with conversation history
-    const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
-      {
-        role: "system",
-        content: buildSystemPrompt(config, questionType) + languageInstruction,
-      },
-    ];
-
-    // Inject conversation memory if available
-    if (sessionId) {
-      const history = conversationMemory.getHistory(sessionId);
-      if (history.length > 0) {
-        messages.push({
-          role: "system",
-          content: "Previous conversation context (use this to avoid repetition and build coherent answers):",
-        });
-        for (const entry of history) {
-          messages.push({ role: entry.role, content: entry.content });
-        }
-      }
-    }
-
-    messages.push({
-      role: "user",
-      content: question,
-    });
-
-    const stream = await openai.chat.completions.create({
-      model: "llama-3.1-8b-instant",
-      messages,
-      stream: true,
-      max_tokens: 2000,
-      temperature: 0.4,
-      top_p: 0.9,
-    });
-
-    let fullAnswer = "";
-
-    for await (const chunk of stream) {
-      const content = chunk.choices[0]?.delta?.content;
-      if (content) {
-        fullAnswer += content;
-        callbacks.onChunk(content);
-      }
-    }
-
-    // Save to conversation memory
-    if (sessionId) {
-      conversationMemory.addExchange(sessionId, question, fullAnswer);
-    }
-
-    console.log(`\n[LLM] AI Response (streamManualAnswer | type=${questionType}):\n`, fullAnswer, "\n");
-    callbacks.onComplete(fullAnswer);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : "LLM streaming failed";
-    console.error("[LLM] Manual answer stream error:", message);
-    callbacks.onError(message);
-  }
+  const userMessageContent = `The interviewer asked: "${question}"\n\nProvide the perfect vocal answer script matching my profile. Remember: start directly with the answer text, split every bullet point item out completely using a dash (-) and separated by distinct double line breaks. Do not use code backticks for short tags or attribute values.`;
+  return executeStream(question, config, callbacks, userMessageContent, language, sessionId);
 }
 
-/**
- * Stream an AI analysis of a screenshot using the vision model.
- * Receives a raw image buffer and sends it to the vision API.
- */
+export function streamManualAnswer(
+  question: string,
+  config: ExtendedInterviewConfig | undefined,
+  callbacks: StreamCallbacks,
+  language?: string,
+  sessionId?: string
+): Promise<void> {
+  const userMessageContent = `${question}\n\nRemember: start directly with the answer text, split every bullet point item out completely using a dash (-) and separated by distinct double line breaks. Do not use code backticks for short tags or attribute values.`;
+  return executeStream(question, config, callbacks, userMessageContent, language, sessionId);
+}
+
+// ─── Visual & Code Context Streaming ──────────────────────────────────
+
 export async function streamScreenAnalysis(
   imageBuffer: Buffer,
   mimeType: string,
-  config: InterviewConfig | undefined,
-  callbacks: StreamCallbacks
+  config: ExtendedInterviewConfig | undefined,
+  callbacks: StreamCallbacks,
+  codeContextText?: string
 ): Promise<void> {
   try {
     callbacks.onStart();
 
-    // Convert buffer to base64 data URI
-    const base64Image = imageBuffer.toString("base64");
-    const dataUri = `data:${mimeType || "image/jpeg"};base64,${base64Image}`;
+    // Optimize image before sending to OpenAI
+    const optimizedBuffer = await sharp(imageBuffer)
+      .resize(1200, 1200, {
+        fit: "inside",
+        withoutEnlargement: true
+      })
+      .jpeg({ quality: 80 })
+      .toBuffer();
+
+    const base64Image = optimizedBuffer.toString("base64");
+    const dataUri = `data:image/jpeg;base64,${base64Image}`;
+
+    const contextPrompt = buildSystemPrompt(config, "coding");
+
+    const textPayload = codeContextText
+      ? `Analyze this screenshot along with this context/code text: "${codeContextText}". Provide a highly scannable spoken explanation script addressing the core fix or solution for the interviewer. Start directly without introductory filler. Wrap small code properties or short tags completely in standard quotation marks. Separate list points cleanly with a dash (-) and explicit double line breaks.`
+      : "Analyze this screenshot. Pinpoint the targeted problem or newest chat entry and provide a highly scannable spoken explanation script addressing the solution directly to the interviewer. Start directly without introductory filler. Wrap small code properties or short tags completely in standard quotation marks. Separate list points cleanly with a dash (-) and explicit double line breaks.";
 
     const stream = await openai.chat.completions.create({
-      model: "llama-3.2-11b-vision-preview",
+      model: "gpt-4o",
       messages: [
         {
           role: "system",
-          content: SCREEN_ANALYSIS_PROMPT,
+          content: `${contextPrompt}\n\n${SCREEN_ANALYSIS_PROMPT}`,
         },
         {
           role: "user",
           content: [
-            {
-              type: "text",
-              text: "Analyze this screenshot from my interview and help me answer the question or solve the problem shown.",
-            },
+            { type: "text", text: textPayload },
             {
               type: "image_url",
-              image_url: {
-                url: dataUri,
-                detail: "high",
-              },
+              image_url: { url: dataUri, detail: "high" },
             },
           ],
         },
       ],
       stream: true,
       max_tokens: 3000,
-      temperature: 0.4,
+      temperature: 0.2,
       top_p: 0.9,
     });
 
     let fullAnswer = "";
-
     for await (const chunk of stream) {
       const content = chunk.choices[0]?.delta?.content;
       if (content) {
@@ -457,11 +346,9 @@ export async function streamScreenAnalysis(
       }
     }
 
-    console.log("\n[LLM] AI Response (streamScreenAnalysis):\n", fullAnswer, "\n");
     callbacks.onComplete(fullAnswer);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Vision analysis failed";
-    console.error("[LLM] Screen analysis error:", message);
     callbacks.onError(message);
   }
 }

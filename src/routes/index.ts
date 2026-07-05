@@ -1,6 +1,7 @@
 import { Router } from "express";
 import authRoutes from "./auth.js";
 import interviewRoutes from "./interviews.js";
+import devBridgeRoutes from "./devBridge.js";
 
 const router = Router();
 
@@ -16,5 +17,6 @@ router.get("/health", (_req, res) => {
 // Mount route groups
 router.use("/auth", authRoutes);
 router.use("/interviews", interviewRoutes);
+router.use("/dev", devBridgeRoutes);
 
 export default router;
