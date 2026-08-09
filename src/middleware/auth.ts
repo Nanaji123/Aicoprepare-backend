@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from "express";
-import { supabaseAuth } from "../lib/supabase.js";
+import { supabaseAdmin } from "../lib/supabase.js";
 
 /**
  * Express middleware that verifies the Supabase JWT from the
@@ -25,7 +25,7 @@ export async function authMiddleware(
     const {
       data: { user },
       error,
-    } = await supabaseAuth.auth.getUser(token);
+    } = await supabaseAdmin.auth.getUser(token);
 
     if (error || !user) {
       res.status(401).json({ message: "Invalid or expired token" });
