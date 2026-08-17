@@ -7,6 +7,8 @@ import {
   needsResponse,
 } from "../services/llm.js";
 import { getSession, saveAIAnswer } from "../services/interview.js";
+import { startMetering, stopMetering } from "../services/metering.js";
+import { getBalance } from "../services/credits.js";
 import type {
   JoinSessionPayload,
   TranscriptFinalPayload,
@@ -73,10 +75,33 @@ export function registerCopilotHandlers(namespace: Namespace): void {
         `[Copilot] User ${userId} joined session ${sessionId}`
       );
 
+      // Refuse to run a session with no credits, then start metering it.
+      let balance = 0;
+      try {
+        balance = (await getBalance(userId)).balance;
+      } catch (err) {
+        console.error("[Copilot] Could not read credit balance:", err);
+      }
+
+      if (balance < 1) {
+        socket.emit("session_terminated", {
+          sessionId,
+          reason: "INSUFFICIENT_CREDITS",
+          message: "You have no credits remaining. Top up to start a session.",
+          balance,
+        });
+        return;
+      }
+
+      startMetering(sessionId, userId, (event, data) =>
+        namespace.to(sessionId).emit(event, data)
+      );
+
       socket.emit("connection_status", {
         status: "connected",
         sessionId,
         userId,
+        balance,
       });
     });
 
@@ -117,11 +142,15 @@ export function registerCopilotHandlers(namespace: Namespace): void {
         }
       }
 
-      // Stream AI answer back to the client (with conversation memory)
+      // Stream AI answer back to the client (with conversation memory).
+      // `question` rides along on every event so the client can show what each
+      // answer is responding to — it was previously only persisted to the DB.
       await streamAnswer(text, config, {
         onStart: () => {
           socket.emit("ai_answer_start", {
             sessionId,
+            question: text,
+            source: "transcript",
             timestamp: new Date().toISOString(),
           });
         },
@@ -135,6 +164,8 @@ export function registerCopilotHandlers(namespace: Namespace): void {
         onComplete: async (fullAnswer: string) => {
           socket.emit("ai_answer", {
             sessionId,
+            question: text,
+            source: "transcript",
             answer: fullAnswer,
             timestamp: new Date().toISOString(),
           });
@@ -148,6 +179,8 @@ export function registerCopilotHandlers(namespace: Namespace): void {
           console.error("[Copilot] AI answer error:", error);
           socket.emit("ai_answer", {
             sessionId,
+            question: text,
+            source: "transcript",
             answer: `⚠️ Sorry, I couldn't generate an answer. Error: ${error}`,
             timestamp: new Date().toISOString(),
           });
@@ -172,6 +205,8 @@ export function registerCopilotHandlers(namespace: Namespace): void {
         onStart: () => {
           socket.emit("ai_answer_start", {
             sessionId,
+            question: text,
+            source: "transcript",
             timestamp: new Date().toISOString(),
           });
         },
@@ -185,6 +220,8 @@ export function registerCopilotHandlers(namespace: Namespace): void {
         onComplete: async (fullAnswer: string) => {
           socket.emit("ai_answer", {
             sessionId,
+            question: text,
+            source: "transcript",
             answer: fullAnswer,
             timestamp: new Date().toISOString(),
           });
@@ -196,6 +233,8 @@ export function registerCopilotHandlers(namespace: Namespace): void {
         onError: (error: string) => {
           socket.emit("ai_answer", {
             sessionId,
+            question: text,
+            source: "transcript",
             answer: `⚠️ Sorry, I couldn't generate an answer. Error: ${error}`,
             timestamp: new Date().toISOString(),
           });
@@ -220,6 +259,8 @@ export function registerCopilotHandlers(namespace: Namespace): void {
         onStart: () => {
           socket.emit("ai_answer_start", {
             sessionId,
+            question,
+            source: "manual",
             timestamp: new Date().toISOString(),
           });
         },
@@ -233,6 +274,8 @@ export function registerCopilotHandlers(namespace: Namespace): void {
         onComplete: async (fullAnswer: string) => {
           socket.emit("ai_answer", {
             sessionId,
+            question,
+            source: "manual",
             answer: fullAnswer,
             timestamp: new Date().toISOString(),
           });
@@ -244,6 +287,8 @@ export function registerCopilotHandlers(namespace: Namespace): void {
         onError: (error: string) => {
           socket.emit("ai_answer", {
             sessionId,
+            question,
+            source: "manual",
             answer: `⚠️ Sorry, I couldn't generate an answer. Error: ${error}`,
             timestamp: new Date().toISOString(),
           });
@@ -265,10 +310,16 @@ export function registerCopilotHandlers(namespace: Namespace): void {
       // Convert the incoming data to a Buffer
       const imageBuffer = Buffer.from(uint8Array);
 
+      // Screen analysis has no spoken question — the client labels it from
+      // `source` rather than rendering this placeholder verbatim.
+      const screenQuestion = "[Screenshot Analysis]";
+
       await streamScreenAnalysis(imageBuffer, mimeType, config, {
         onStart: () => {
           socket.emit("ai_answer_start", {
             sessionId,
+            question: screenQuestion,
+            source: "screen",
             timestamp: new Date().toISOString(),
           });
         },
@@ -282,22 +333,22 @@ export function registerCopilotHandlers(namespace: Namespace): void {
         onComplete: async (fullAnswer: string) => {
           socket.emit("ai_answer", {
             sessionId,
+            question: screenQuestion,
+            source: "screen",
             answer: fullAnswer,
             timestamp: new Date().toISOString(),
           });
 
-          saveAIAnswer(
-            sessionId,
-            "[Screenshot Analysis]",
-            fullAnswer,
-            "screen"
-          ).catch((err) =>
-            console.error("[Copilot] Failed to save screen analysis:", err)
+          saveAIAnswer(sessionId, screenQuestion, fullAnswer, "screen").catch(
+            (err) =>
+              console.error("[Copilot] Failed to save screen analysis:", err)
           );
         },
         onError: (error: string) => {
           socket.emit("ai_answer", {
             sessionId,
+            question: screenQuestion,
+            source: "screen",
             answer: `⚠️ Sorry, I couldn't analyze the screenshot. Error: ${error}`,
             timestamp: new Date().toISOString(),
           });
@@ -313,6 +364,8 @@ export function registerCopilotHandlers(namespace: Namespace): void {
       sessionConfigs.delete(sessionId);
       answerModes.delete(sessionId);
       conversationMemory.clear(sessionId);
+      // Stop billing the moment the user leaves.
+      stopMetering(sessionId);
 
       console.log(
         `[Copilot] User ${userId} left session ${sessionId}`
@@ -330,6 +383,8 @@ export function registerCopilotHandlers(namespace: Namespace): void {
         sessionConfigs.delete(currentSessionId);
         answerModes.delete(currentSessionId);
         conversationMemory.clear(currentSessionId);
+        // A dropped client must stop burning credits.
+        stopMetering(currentSessionId);
       }
     });
   });

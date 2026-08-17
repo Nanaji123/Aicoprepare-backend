@@ -1,4 +1,4 @@
--- CoPrep Backend — Initial Database Schema
+-- PathMaker4u Backend — Initial Database Schema
 -- Run this in Supabase SQL Editor (Dashboard → SQL Editor → New Query)
 
 -- ─── Interviews ───────────────────────────────────────────────────

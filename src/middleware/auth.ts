@@ -1,5 +1,16 @@
 import { Request, Response, NextFunction } from "express";
-import { supabaseAdmin } from "../lib/supabase.js";
+import { createRemoteJWKSet, jwtVerify } from "jose";
+import { env } from "../config/env.js";
+
+/**
+ * JWKS is fetched once and cached in-memory for the life of the process
+ * (jose only re-fetches if it sees an unrecognized `kid`), so verifying a
+ * token costs zero network round-trips after the first request — unlike
+ * supabaseAdmin.auth.getUser(), which calls out to Supabase on every call.
+ */
+const jwks = createRemoteJWKSet(
+  new URL(`${env.SUPABASE_URL}/auth/v1/.well-known/jwks.json`)
+);
 
 /**
  * Express middleware that verifies the Supabase JWT from the
@@ -22,25 +33,23 @@ export async function authMiddleware(
   const token = authHeader.replace("Bearer ", "");
 
   try {
-    const {
-      data: { user },
-      error,
-    } = await supabaseAdmin.auth.getUser(token);
+    const { payload } = await jwtVerify(token, jwks, {
+      issuer: `${env.SUPABASE_URL}/auth/v1`,
+    });
 
-    if (error || !user) {
+    if (!payload.sub) {
       res.status(401).json({ message: "Invalid or expired token" });
       return;
     }
 
     // Attach user info to the request for downstream handlers
     req.user = {
-      id: user.id,
-      email: user.email,
+      id: payload.sub,
+      email: payload.email as string | undefined,
     };
 
     next();
   } catch (err) {
-    console.error("[Auth] Token verification error:", err);
-    res.status(500).json({ message: "Authentication service error" });
+    res.status(401).json({ message: "Invalid or expired token" });
   }
 }

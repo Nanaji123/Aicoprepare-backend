@@ -4,12 +4,13 @@ import cors from "cors";
 import { env } from "./config/env.js";
 import routes from "./routes/index.js";
 import { initializeSocketIO } from "./sockets/index.js";
+import { closeStaleSessions } from "./services/interview.js";
 
 /**
- * CoPrep Backend Server
+ * PathMaker4u Backend Server
  *
  * Express REST API + Socket.IO real-time server.
- * Powers the CoPrep Desktop interview copilot app.
+ * Powers the PathMaker4u Desktop interview copilot app.
  */
 
 const app = express();
@@ -66,7 +67,7 @@ httpServer.listen(env.PORT, () => {
   console.log(`
 ╔══════════════════════════════════════════════════════╗
 ║                                                      ║
-║   🚀 CoPrep Backend Server                           ║
+║   🚀 PathMaker4u Backend Server                           ║
 ║                                                      ║
 ║   REST API:    http://localhost:${env.PORT}/api         ║
 ║   Socket.IO:   ws://localhost:${env.PORT}/copilot       ║
@@ -76,6 +77,26 @@ httpServer.listen(env.PORT, () => {
 ╚══════════════════════════════════════════════════════╝
   `);
 });
+
+// ─── Stale session sweep ───────────────────────────────────────────
+// A crashed or force-quit client never sends its "end" call, leaving the
+// session `active` forever. Metering timers also die with a server restart,
+// so anything still open from a previous process is stale by definition.
+const STALE_SWEEP_INTERVAL_MS = 30 * 60 * 1000; // every 30 min
+const STALE_AFTER_HOURS = 6;
+
+closeStaleSessions(STALE_AFTER_HOURS).catch((err) =>
+  console.error("[Server] Initial stale sweep failed:", err)
+);
+
+const staleSweep = setInterval(() => {
+  closeStaleSessions(STALE_AFTER_HOURS).catch((err) =>
+    console.error("[Server] Stale sweep failed:", err)
+  );
+}, STALE_SWEEP_INTERVAL_MS);
+
+// Don't hold the process open just for the sweep timer.
+staleSweep.unref();
 
 // Graceful shutdown
 process.on("SIGINT", () => {

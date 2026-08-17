@@ -1,9 +1,10 @@
 {
-  "name": "coprep-backend",
+  "name": "pathmaker4u-backend",
   "version": "1.0.0",
-  "description": "CoPrep AI Interview Assistant — Backend Server",
+  "description": "PathMaker4u AI Interview Assistant — Backend Server",
   "main": "dist/index.js",
   "scripts": {
+    "predev": "lsof -ti:${PORT:-3001} | xargs -I{} kill {} 2>/dev/null || true",
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "postinstall": "npm run build",
@@ -23,6 +24,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.5.0",
     "express": "^5.1.0",
+    "jose": "^6.2.8",
     "openai": "^5.8.2",
     "sharp": "^0.35.3",
     "socket.io": "^4.8.1"
