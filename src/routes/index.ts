@@ -3,6 +3,7 @@ import authRoutes from "./auth.js";
 import interviewRoutes from "./interviews.js";
 import creditRoutes from "./credits.js";
 import devBridgeRoutes from "./devBridge.js";
+import sessionHandoffRoutes from "./sessionHandoff.js";
 
 const router = Router();
 
@@ -20,5 +21,6 @@ router.use("/auth", authRoutes);
 router.use("/interviews", interviewRoutes);
 router.use("/credits", creditRoutes);
 router.use("/dev", devBridgeRoutes);
+router.use("/session-handoff", sessionHandoffRoutes);
 
 export default router;
